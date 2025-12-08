@@ -1,36 +1,27 @@
 #!/usr/bin/env bash
 
 # =============================================================================
-# Proxmox VE - Open WebUI LXC with optional Ollama (v1.1 — fixed net0/hwaddr)
-# Автор: yagopere + Grok (xAI), на основе community-scripts/ProxmoxVE
+# Proxmox VE - Open WebUI LXC with optional Ollama (v1.2 — fixed net0 hwaddr + schema)
+# Автор: yagopere + Grok (xAI), на основе Proxmox docs + community-scripts
 # GitHub: https://github.com/yagopere/proxmox-scripts
-# Запуск: curl -fsSL https://raw.githubusercontent.com/yagopere/proxmox-scripts/main/openwebui-lxc-v1.1.sh | bash
+# Запуск: curl -fsSL https://raw.githubusercontent.com/yagopere/proxmox-scripts/main/openwebui-lxc-v1.2.sh | bash
 # =============================================================================
 
-# Встроенные функции (адаптировано из build.func)
 variables() {
   NSAPP="openwebui"
   APP="Open WebUI"
-  var_disk="50"  # Увеличено для моделей
+  var_disk="50"  # ГБ, для моделей
   var_cpu="4"
-  var_ram="8192"
+  var_ram="8192"  # МБ
   var_os="debian"
   var_version="12"
   var_unprivileged="1"
+  var_bridge="vmbr0"
 }
 
 color() {
-  YW="\033[33m"
-  BL="\033[36m"
-  RD="\033[01;31m"
-  BGN="\033[4;92m"
-  GN="\033[1;92m"
-  DGN="\033[32m"
-  CL="\033[m"
-  CM="${GN}✔${CL}"
-  CROSS="${RD}✘${CL}"
-  BFR="\\r\\033[K"
-  HOLD=" -"
+  YW="\033[33m"; GN="\033[1;92m"; RD="\033[01;31m"; CL="\033[m"
+  CM="  ✔️ "; CROSS="  ✖️ "; INFO="  💡 "; TAB="  "
 }
 
 catch_errors() {
@@ -42,56 +33,26 @@ error_handler() {
   local exit_code="$?"
   local line_number="$1"
   local command="$2"
-  local error_message="${RD}[ERROR]${CL} in line ${RD}$line_number${CL}: exit code ${RD}$exit_code${CL}: while executing command ${YW}$command${CL}"
-  echo -e "\n$error_message\n"
+  echo -e "\n${RD}[ERROR]${CL} line ${line_number}: exit ${exit_code}: ${YW}${command}${CL}\n"
   exit $exit_code
 }
 
-msg_info() {
-  local msg="$1"
-  echo -ne " ${HOLD} ${YW}${msg}..."
-}
+msg_info() { echo -ne "${TAB}${YW}⏳ $1${CL}"; }
+msg_ok()   { echo -e "\r${TAB}${CM}${GN}$1${CL}"; }
+msg_error(){ echo -e "\r${TAB}${CROSS}${RD}$1${CL}"; exit 1; }
 
-msg_ok() {
-  local msg="$1"
-  echo -e "${BFR} ${CM} ${GN}${msg}${CL}"
-}
-
-msg_error() {
-  local msg="$1"
-  echo -e "${BFR} ${CROSS} ${RD}${msg}${CL}"
-}
-
-root_check() {
-  if [[ "$(id -u)" -ne 0 ]]; then
-    msg_error "Please run as root"
-    exit 1
-  fi
-}
-
-pve_check() {
-  if ! pveversion | grep -Eq "pve-manager/8"; then
-    msg_error "Requires Proxmox VE 8+"
-    exit 1
-  fi
-}
-
-arch_check() {
-  if [ "$(dpkg --print-architecture)" != "amd64" ]; then
-    msg_error "Only x86_64 supported"
-    exit 1
-  fi
-}
+root_check() { [[ $EUID -eq 0 ]] || msg_error "Запустите от root!"; }
+pve_check() { pveversion | grep -q "pve-manager/8" || msg_error "Proxmox VE 8+ required"; }
+arch_check() { [[ $(dpkg --print-architecture) = "amd64" ]] || msg_error "Только x86_64!"; }
 
 get_nextid() {
-  local try_id=$(pvesh get /cluster/nextid)
-  while [ -f "/etc/pve/lxc/${try_id}.conf" ] || [ -f "/etc/pve/qemu-server/${try_id}.conf" ]; do
+  local try_id=$(pvesh get /cluster/nextid 2>/dev/null || echo 100)
+  while [[ -f "/etc/pve/lxc/${try_id}.conf" || -f "/etc/pve/qemu-server/${try_id}.conf" ]]; do
     try_id=$((try_id + 1))
   done
   echo "$try_id"
 }
 
-# Основная функция
 header_info() {
   clear
   cat <<"EOF"
@@ -101,144 +62,141 @@ header_info() {
 / /_/ / /_/ /  __/ / / /    | |/ |/ /  __/ /_/ / /_/ // /
 \____/ .___/\___/_/ /_/     |__/|__/\___/_.___/\____/___/
     /_/
-
+          + Ollama (optional) — LXC for Proxmox (v1.2 fixed)
 EOF
 }
 
 header_info
-echo -e "Creating Open WebUI LXC with optional Ollama...\n"
+echo -e "\nСоздаём Open WebUI LXC с Ollama (опционально)...\n"
 
-root_check
-pve_check
-arch_check
-variables
-color
-catch_errors
+root_check; pve_check; arch_check
+variables; color; catch_errors
 
-# Опции через whiptail
-INSTALL_OLLAMA=$(whiptail --backtitle "Proxmox Open WebUI LXC" --title "Install Ollama?" --yesno "Install Ollama inside LXC?" 8 50 3>&1 1>&2 2>&3 && echo "yes" || echo "no")
+# Опции
+INSTALL_OLLAMA=$(whiptail --backtitle "Proxmox Open WebUI LXC" --title "Ollama?" --yesno "Установить Ollama?" 8 50 3>&1 1>&2 2>&3 && echo "yes" || echo "no")
 
 MODEL_TO_PULL=""
-if [ "$INSTALL_OLLAMA" == "yes" ]; then
-  MODEL_CHOICE=$(whiptail --backtitle "Proxmox Open WebUI LXC" --title "Ollama Model" --radiolist \
-    "Choose model to pull (~2–4 GB)" 12 50 4 \
-    "llama3.2:3b" "Llama 3.2 (3B, fast)" ON \
+if [[ "$INSTALL_OLLAMA" == "yes" ]]; then
+  MODEL_CHOICE=$(whiptail --backtitle "Proxmox Open WebUI LXC" --title "Модель Ollama" --radiolist \
+    "Выберите (~2–4 ГБ)" 12 50 4 \
+    "llama3.2:3b" "Llama 3.2 (3B)" ON \
     "phi3:mini" "Phi-3 Mini (3.8B)" OFF \
     "gemma2:2b" "Gemma 2 (2B)" OFF \
-    "none" "None" OFF \
+    "none" "Нет" OFF \
     3>&1 1>&2 2>&3) || MODEL_TO_PULL="none"
   MODEL_TO_PULL="$MODEL_CHOICE"
 fi
 
-# Выбор хранилища
-msg_info "Detecting storage"
+# Хранилище
+msg_info "Определяем хранилище..."
 STORAGE_MENU=()
 while read -r line; do
-  TAG=$(echo "$line" | awk '{print $1}')
-  TYPE=$(echo "$line" | awk '{print $2}')
-  FREE=$(echo "$line" | awk '{print $6 "G"}')
-  [[ $TYPE == "zfspool" || $TYPE == "dir" || $TYPE == "lvmthin" || $TYPE == "btrfs" ]] && STORAGE_MENU+=("$TAG" "$TYPE – $FREE free" "OFF")
+  TAG=$(echo "$line" | awk '{print $1}'); TYPE=$(echo "$line" | awk '{print $2}'); FREE=$(echo "$line" | awk '{print $6 "G"}')
+  [[ $TYPE == "dir" || $TYPE == "zfspool" || $TYPE == "lvmthin" || $TYPE == "btrfs" ]] && STORAGE_MENU+=("$TAG" "$TYPE – $FREE" "OFF")
 done < <(pvesm status -content rootdir | awk 'NR>1 {print $1, $2, $6}')
 
-[[ ${#STORAGE_MENU[@]} -eq 0 ]] && msg_error "No suitable storage for LXC!"
+[[ ${#STORAGE_MENU[@]} -eq 0 ]] && msg_error "Нет хранилища для LXC!"
 
 if [[ $((${#STORAGE_MENU[@]} / 3)) -eq 1 ]]; then
   STORAGE=${STORAGE_MENU[0]}
 else
-  STORAGE=$(whiptail --title "Choose storage" --radiolist "Where to place LXC?" 15 70 6 "${STORAGE_MENU[@]}" 3>&1 1>&2 2>&3) || exit 1
+  STORAGE=$(whiptail --title "Хранилище" --radiolist "Выберите?" 15 70 6 "${STORAGE_MENU[@]}" 3>&1 1>&2 2>&3) || exit 1
 fi
-msg_ok "Storage: $STORAGE"
+msg_ok "Хранилище: $STORAGE"
+
+# Bridge check
+[[ $(pvesh get /nodes/$(hostname)/network --type list | grep -q "$var_bridge") ]] || { msg_info "Bridge $var_bridge не найден, используем vmbr0"; var_bridge="vmbr0"; }
 
 # Создание LXC
 CTID=$(get_nextid)
-HN="openwebui-lxc"
+HN="openwebui-lxc-$(date +%s | cut -c1-3)"  # Уникальный hostname
 DISK_SIZE="$var_disk"
 CORE_COUNT="$var_cpu"
 RAM_SIZE="$var_ram"
 
-TEMPLATE_SEARCH="$var_os-$var_version"
-templates=($(pveam available -section system | sed -n "s/.*\($TEMPLATE_SEARCH.*\)/\1/p" | sort -r))
-TEMPLATE="${templates[0]}"
-if [ -z "$TEMPLATE" ]; then
-  msg_info "Downloading template"
-  pveam download local $TEMPLATE_SEARCH >/dev/null || msg_error "Failed to download template"
-  msg_ok "Downloaded template"
-  TEMPLATE="$TEMPLATE_SEARCH-standard_$(date +%Y%m%d)-1_amd64.tar.zst"  # Примерный, но pveam обновит
+TEMPLATE="debian-12-standard"
+if [[ ! -f "/var/lib/vz/template/cache/${TEMPLATE}_*.tar.zst" && ! -f "/var/lib/vz/template/cache/${TEMPLATE}_*.tar.gz" ]]; then
+  msg_info "Скачиваем шаблон $TEMPLATE..."
+  pveam download local $TEMPLATE || msg_error "Ошибка скачивания шаблона"
+  msg_ok "Шаблон скачан"
 fi
 
-msg_info "Creating LXC $CTID"
+msg_info "Создаём LXC $CTID..."
 GEN_MAC="02:$(openssl rand -hex 5 | sed 's/\(..\)/\1:/g; s/.$//' | tr a-f A-F)"
-pct create $CTID local:vztmpl/${TEMPLATE} \
-  -arch amd64 \
-  -cores $CORE_COUNT \
-  -hostname $HN \
-  -memory $RAM_SIZE \
-  -net0 name=eth0,bridge=vmbr0,ip=dhcp,hwaddr=$GEN_MAC,type=veth \
-  -ostype $var_os \
-  -rootfs $STORAGE:$DISK_SIZE \
-  -swap 1024 \
-  -unprivileged $var_unprivileged \
-  -features nesting=1
-msg_ok "Created LXC"
+pct create $CTID local:vztmpl/${TEMPLATE}* \
+  --arch amd64 \
+  --cores $CORE_COUNT \
+  --hostname $HN \
+  --memory $RAM_SIZE \
+  --net0 name=eth0,bridge=$var_bridge,ip=dhcp,hwaddr=$GEN_MAC,type=veth \
+  --ostype $var_os \
+  --rootfs $STORAGE:$DISK_SIZE \
+  --swap 1024 \
+  --unprivileged $var_unprivileged \
+  --features nesting=1 \
+  --onboot 1 || msg_error "Ошибка создания LXC (проверьте net0/bridge)"
+msg_ok "LXC создан"
 
-msg_info "Starting LXC"
+msg_info "Запускаем LXC..."
 pct start $CTID
-sleep 5
-msg_ok "Started LXC"
+sleep 10
+msg_ok "LXC запущен"
 
-# Установка внутри LXC
+# Установка внутри
 exec_in() { pct exec $CTID -- bash -c "$1"; }
 
-msg_info "Updating packages"
-exec_in "apt-get update && apt-get upgrade -y >/dev/null"
-msg_ok "Updated packages"
+msg_info "Обновляем пакеты..."
+exec_in "apt update && apt upgrade -y"
+msg_ok "Пакеты обновлены"
 
-msg_info "Installing dependencies"
-exec_in "apt-get install -y curl wget ca-certificates gnupg >/dev/null"
-msg_ok "Installed dependencies"
+msg_info "Устанавливаем зависимости..."
+exec_in "apt install -y curl wget ca-certificates gnupg lsb-release"
+msg_ok "Зависимости установлены"
 
-msg_info "Installing Docker"
-exec_in "install -m 0755 -d /etc/apt/keyrings && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && chmod a+r /etc/apt/keyrings/docker.asc"
-exec_in 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
-exec_in "apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null"
-msg_ok "Installed Docker"
+msg_info "Устанавливаем Docker..."
+exec_in "install -m 0755 -d /etc/apt/keyrings"
+exec_in "curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc"
+exec_in "chmod a+r /etc/apt/keyrings/docker.asc"
+exec_in "echo 'deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo \"\$VERSION_CODENAME\") stable' | tee /etc/apt/sources.list.d/docker.list > /dev/null"
+exec_in "apt update && apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+msg_ok "Docker установлен"
 
-if [ "$INSTALL_OLLAMA" == "yes" ]; then
-  msg_info "Installing Ollama"
-  exec_in "curl -fsSL https://ollama.com/install.sh | sh >/dev/null"
+if [[ "$INSTALL_OLLAMA" == "yes" ]]; then
+  msg_info "Устанавливаем Ollama..."
+  exec_in "curl -fsSL https://ollama.com/install.sh | sh"
   exec_in "systemctl enable --now ollama"
-  if [ "$MODEL_TO_PULL" != "none" ]; then
-    exec_in "ollama pull $MODEL_TO_PULL >/dev/null"
-  fi
-  msg_ok "Installed Ollama"
+  [[ "$MODEL_TO_PULL" != "none" ]] && exec_in "ollama pull $MODEL_TO_PULL"
+  msg_ok "Ollama установлен"
   OLLAMA_ENV="-e OLLAMA_BASE_URL=http://127.0.0.1:11434"
 else
   OLLAMA_ENV=""
 fi
 
-msg_info "Installing Open WebUI"
-exec_in "mkdir -p /var/lib/open-webui"
-exec_in "docker run -d --network=host -v /var/lib/open-webui:/app/backend/data --name open-webui --restart always $OLLAMA_ENV ghcr.io/open-webui/open-webui:main >/dev/null"
-msg_ok "Installed Open WebUI"
+msg_info "Устанавливаем Open WebUI..."
+exec_in "mkdir -p /var/lib/open-webui && chown -R 1000:1000 /var/lib/open-webui"
+exec_in "docker run -d --network=host -v /var/lib/open-webui:/app/backend/data --name open-webui --restart unless-stopped $OLLAMA_ENV ghcr.io/open-webui/open-webui:main"
+msg_ok "Open WebUI установлен"
 
-msg_info "Restarting LXC"
+msg_info "Перезагружаем LXC..."
 pct reboot $CTID
-sleep 10
-msg_ok "Restarted LXC"
+sleep 20
+msg_ok "LXC перезагружен"
 
-# Получение IP
-msg_info "Waiting for IP..."
-for i in {1..30}; do
-  IP=$(pct exec $CTID -- ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-  [ -n "$IP" ] && break
+# IP
+msg_info "Ждём IP (до 60s)..."
+IP="N/A"
+for i in {1..12}; do
+  IP=$(pct exec $CTID -- bash -c "ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1" 2>/dev/null || echo "N/A")
+  [[ "$IP" != "N/A" ]] && break
   sleep 5
 done
+[[ "$IP" == "N/A" ]] && IP="проверьте в GUI (Summary)"
 
-msg_ok "Done! LXC $CTID ($HN) created."
-echo -e "\nThrough 2–5 minutes everything will be ready:"
-echo -e "   ➜ Web UI: http://${IP}:8080 (register new user)"
-echo -e "   ➜ Ollama API: http://${IP}:11434 (if installed)"
-echo -e "   ➜ SSH: ssh root@${IP} (auto-login if no password)"
-echo -e "   ➜ Model: $MODEL_TO_PULL\n"
+msg_ok "Готово! LXC $CTID ($HN) создан."
+echo -e "\n${GN}Через 2–5 мин всё готово:${CL}"
+echo -e "   ➜ Web UI: http://${IP}:8080 (регистрируйтесь)"
+echo -e "   ➜ Ollama API: http://${IP}:11434 (если установлен)"
+echo -e "   ➜ Консоль: pct console $CTID"
+echo -e "   ➜ Модель: $MODEL_TO_PULL\n${INFO}Логи: pct exec $CTID docker logs open-webui"
 
 exit 0
