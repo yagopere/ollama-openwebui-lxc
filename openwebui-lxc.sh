@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 
 # =============================================================================
-# Proxmox VE - Open WebUI LXC with optional Ollama (v1.2 — fixed net0 hwaddr + schema)
-# Автор: yagopere + Grok (xAI), на основе Proxmox docs + community-scripts
+# Proxmox VE - Open WebUI LXC with optional Ollama (v1.3 — official pct.1 syntax)
+# Автор: yagopere + Grok (xAI), на основе pve-docs/pct.1.html
 # GitHub: https://github.com/yagopere/proxmox-scripts
-# Запуск: curl -fsSL https://raw.githubusercontent.com/yagopere/proxmox-scripts/main/openwebui-lxc-v1.2.sh | bash
+# Запуск: curl -fsSL https://raw.githubusercontent.com/yagopere/proxmox-scripts/main/openwebui-lxc-v1.3.sh | bash
 # =============================================================================
 
 variables() {
-  NSAPP="openwebui"
-  APP="Open WebUI"
-  var_disk="50"  # ГБ, для моделей
+  var_disk="50"  # ГБ
   var_cpu="4"
   var_ram="8192"  # МБ
   var_os="debian"
@@ -62,7 +60,7 @@ header_info() {
 / /_/ / /_/ /  __/ / / /    | |/ |/ /  __/ /_/ / /_/ // /
 \____/ .___/\___/_/ /_/     |__/|__/\___/_.___/\____/___/
     /_/
-          + Ollama (optional) — LXC for Proxmox (v1.2 fixed)
+          + Ollama (optional) — LXC for Proxmox VE 8.4+ (v1.3)
 EOF
 }
 
@@ -105,17 +103,17 @@ fi
 msg_ok "Хранилище: $STORAGE"
 
 # Bridge check
-[[ $(pvesh get /nodes/$(hostname)/network --type list | grep -q "$var_bridge") ]] || { msg_info "Bridge $var_bridge не найден, используем vmbr0"; var_bridge="vmbr0"; }
+pvesh get /nodes/$(hostname)/network --type list | grep -q "$var_bridge" || { msg_info "Bridge $var_bridge не найден, используем vmbr0"; var_bridge="vmbr0"; }
 
 # Создание LXC
 CTID=$(get_nextid)
-HN="openwebui-lxc-$(date +%s | cut -c1-3)"  # Уникальный hostname
+HN="openwebui-lxc-$(date +%s | cut -c1-3)"
 DISK_SIZE="$var_disk"
 CORE_COUNT="$var_cpu"
 RAM_SIZE="$var_ram"
 
 TEMPLATE="debian-12-standard"
-if [[ ! -f "/var/lib/vz/template/cache/${TEMPLATE}_*.tar.zst" && ! -f "/var/lib/vz/template/cache/${TEMPLATE}_*.tar.gz" ]]; then
+if ! ls /var/lib/vz/template/cache/${TEMPLATE}*.tar.* >/dev/null 2>&1; then
   msg_info "Скачиваем шаблон $TEMPLATE..."
   pveam download local $TEMPLATE || msg_error "Ошибка скачивания шаблона"
   msg_ok "Шаблон скачан"
@@ -123,7 +121,7 @@ fi
 
 msg_info "Создаём LXC $CTID..."
 GEN_MAC="02:$(openssl rand -hex 5 | sed 's/\(..\)/\1:/g; s/.$//' | tr a-f A-F)"
-pct create $CTID local:vztmpl/${TEMPLATE}* \
+pct create $CTID local:vztmpl/${TEMPLATE}*.tar.* \
   --arch amd64 \
   --cores $CORE_COUNT \
   --hostname $HN \
@@ -164,39 +162,4 @@ msg_ok "Docker установлен"
 if [[ "$INSTALL_OLLAMA" == "yes" ]]; then
   msg_info "Устанавливаем Ollama..."
   exec_in "curl -fsSL https://ollama.com/install.sh | sh"
-  exec_in "systemctl enable --now ollama"
-  [[ "$MODEL_TO_PULL" != "none" ]] && exec_in "ollama pull $MODEL_TO_PULL"
-  msg_ok "Ollama установлен"
-  OLLAMA_ENV="-e OLLAMA_BASE_URL=http://127.0.0.1:11434"
-else
-  OLLAMA_ENV=""
-fi
-
-msg_info "Устанавливаем Open WebUI..."
-exec_in "mkdir -p /var/lib/open-webui && chown -R 1000:1000 /var/lib/open-webui"
-exec_in "docker run -d --network=host -v /var/lib/open-webui:/app/backend/data --name open-webui --restart unless-stopped $OLLAMA_ENV ghcr.io/open-webui/open-webui:main"
-msg_ok "Open WebUI установлен"
-
-msg_info "Перезагружаем LXC..."
-pct reboot $CTID
-sleep 20
-msg_ok "LXC перезагружен"
-
-# IP
-msg_info "Ждём IP (до 60s)..."
-IP="N/A"
-for i in {1..12}; do
-  IP=$(pct exec $CTID -- bash -c "ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1" 2>/dev/null || echo "N/A")
-  [[ "$IP" != "N/A" ]] && break
-  sleep 5
-done
-[[ "$IP" == "N/A" ]] && IP="проверьте в GUI (Summary)"
-
-msg_ok "Готово! LXC $CTID ($HN) создан."
-echo -e "\n${GN}Через 2–5 мин всё готово:${CL}"
-echo -e "   ➜ Web UI: http://${IP}:8080 (регистрируйтесь)"
-echo -e "   ➜ Ollama API: http://${IP}:11434 (если установлен)"
-echo -e "   ➜ Консоль: pct console $CTID"
-echo -e "   ➜ Модель: $MODEL_TO_PULL\n${INFO}Логи: pct exec $CTID docker logs open-webui"
-
-exit 0
+  exec_in "systemctl enable --now ollama
