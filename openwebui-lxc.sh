@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 
 # =============================================================================
-# Proxmox VE - Open WebUI LXC with optional Ollama (единый файл)
+# Proxmox VE - Open WebUI LXC with optional Ollama (v1.1 — fixed net0/hwaddr)
 # Автор: yagopere + Grok (xAI), на основе community-scripts/ProxmoxVE
 # GitHub: https://github.com/yagopere/proxmox-scripts
-# Запуск: curl -fsSL https://raw.githubusercontent.com/yagopere/proxmox-scripts/main/openwebui-lxc.sh | bash
+# Запуск: curl -fsSL https://raw.githubusercontent.com/yagopere/proxmox-scripts/main/openwebui-lxc-v1.1.sh | bash
 # =============================================================================
 
 # Встроенные функции (адаптировано из build.func)
 variables() {
   NSAPP="openwebui"
   APP="Open WebUI"
-  var_disk="25"
+  var_disk="50"  # Увеличено для моделей
   var_cpu="4"
   var_ram="8192"
   var_os="debian"
@@ -152,7 +152,7 @@ msg_ok "Storage: $STORAGE"
 # Создание LXC
 CTID=$(get_nextid)
 HN="openwebui-lxc"
-DISK_SIZE="$var_disk"G
+DISK_SIZE="$var_disk"
 CORE_COUNT="$var_cpu"
 RAM_SIZE="$var_ram"
 
@@ -160,17 +160,25 @@ TEMPLATE_SEARCH="$var_os-$var_version"
 templates=($(pveam available -section system | sed -n "s/.*\($TEMPLATE_SEARCH.*\)/\1/p" | sort -r))
 TEMPLATE="${templates[0]}"
 if [ -z "$TEMPLATE" ]; then
-  msg_error "No $TEMPLATE_SEARCH template found."
-  exit 1
+  msg_info "Downloading template"
+  pveam download local $TEMPLATE_SEARCH >/dev/null || msg_error "Failed to download template"
+  msg_ok "Downloaded template"
+  TEMPLATE="$TEMPLATE_SEARCH-standard_$(date +%Y%m%d)-1_amd64.tar.zst"  # Примерный, но pveam обновит
 fi
-
-msg_info "Downloading template"
-pveam download local $TEMPLATE >/dev/null
-msg_ok "Downloaded template"
 
 msg_info "Creating LXC $CTID"
 GEN_MAC="02:$(openssl rand -hex 5 | sed 's/\(..\)/\1:/g; s/.$//' | tr a-f A-F)"
-pct create $CTID local:vztmpl/${TEMPLATE} -arch amd64 -cores $CORE_COUNT -hostname $HN -memory $RAM_SIZE -net0 name=eth0,bridge=vmbr0,ip=dhcp,macaddr=$GEN_MAC -ostype $var_os -rootfs $STORAGE:$DISK_SIZE -swap 1024 -unprivileged $var_unprivileged
+pct create $CTID local:vztmpl/${TEMPLATE} \
+  -arch amd64 \
+  -cores $CORE_COUNT \
+  -hostname $HN \
+  -memory $RAM_SIZE \
+  -net0 name=eth0,bridge=vmbr0,ip=dhcp,hwaddr=$GEN_MAC,type=veth \
+  -ostype $var_os \
+  -rootfs $STORAGE:$DISK_SIZE \
+  -swap 1024 \
+  -unprivileged $var_unprivileged \
+  -features nesting=1
 msg_ok "Created LXC"
 
 msg_info "Starting LXC"
@@ -213,17 +221,18 @@ exec_in "mkdir -p /var/lib/open-webui"
 exec_in "docker run -d --network=host -v /var/lib/open-webui:/app/backend/data --name open-webui --restart always $OLLAMA_ENV ghcr.io/open-webui/open-webui:main >/dev/null"
 msg_ok "Installed Open WebUI"
 
-msg_info "Setting features (nesting for Docker)"
-pct set $CTID -features nesting=1
-msg_ok "Set features"
-
 msg_info "Restarting LXC"
 pct reboot $CTID
 sleep 10
 msg_ok "Restarted LXC"
 
 # Получение IP
-IP=$(pct exec $CTID -- ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || echo "N/A")
+msg_info "Waiting for IP..."
+for i in {1..30}; do
+  IP=$(pct exec $CTID -- ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+  [ -n "$IP" ] && break
+  sleep 5
+done
 
 msg_ok "Done! LXC $CTID ($HN) created."
 echo -e "\nThrough 2–5 minutes everything will be ready:"
