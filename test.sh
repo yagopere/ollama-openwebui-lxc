@@ -1,147 +1,130 @@
-#!/usr/bin/env bash
-set -euo pipefail
-clear
+#!/bin/bash
 
-# ========== Open WebUI + Ollama для Proxmox ==========
-# Оптимизированный скрипт с улучшенной безопасностью, производительностью и отладочными возможностями
+# =============================================
+# Скрипт для установки Ollama + Open WebUI в LXC на Proxmox
+# Автоматически создает VM и настраивает все компоненты
+# =============================================
 
-# --------------------- Настройки ---------------------
-DEFAULT_MODEL="llama3.2:3b"
-CONTAINER_NAME="open-webui"
-OLLAMA_VERSION="0.1.1"  # Проверять актуальность на github.com/ollama/ollama/releases
-DOCKER_IMAGE="ghcr.io/open-webui/open-webui:main"
-MEMORY_LIMIT="4096"     # Мб
-CPU_LIMIT="2"           # Ядра
-SWAP_LIMIT="2048"       # Мб
+# Настройки
+LXC_NAME="ollama-webui"
+LXC_VMID=9999  # Уникальный номер VM в Proxmox
+LXC_CPU="2"
+LXC_RAM="4G"
+LXC_DISK="40G"
+LXC_NETWORK="vmbr0"
+LXC_OS="debian-12"
+LXC_IP="192.168.1.100/24"  # Измените на свой IP
+LXC_GATEWAY="192.168.1.1"
+LXC_DNS="8.8.8.8"
 
-# --------------------- Проверки ---------------------
-echo "=== Начинаем установку Open WebUI + Ollama ==="
-
-# 1. Проверка подключения к интернету
-if ! ping -c1 8.8.8.8 &>/dev/null; then
-    echo "❌ Ошибка: Нет подключения к интернету!"
-    exit 1
-fi
-
-# 2. Проверка на root
+# Проверка прав root
 if [ "$(id -u)" -ne 0 ]; then
-    echo "❌ Ошибка: Скрипт должен запускаться от root"
+    echo "Ошибка: Скрипт должен запускаться от root!"
     exit 1
 fi
 
-# --------------------- Установка зависимостей ---------------------
-echo "📦 Устанавливаем зависимости..."
-apt-get update && \
-apt-get install -y \
-    ca-certificates \
-    curl \
-    gnupg \
-    lsb-release \
-    jq \
-    && rm -rf /var/lib/apt/lists/*
-
-# --------------------- Установка Docker ---------------------
-echo "🐳 Устанавливаем Docker..."
-curl -fsSL https://get.docker.com | sh -c "$(cut -d' ' -f3-)" || \
-    { echo "❌ Ошибка при установке Docker"; exit 1; }
-
-# Настройка Docker для совместимости с LXC
-echo '{"userns-keep-id": true}' > /etc/docker/daemon.json
-systemctl restart docker
-
-# --------------------- Установка Ollama ---------------------
-echo "🦙 Устанавливаем Ollama..."
-OLLAMA_URL="https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-amd64.tgz"
-
-# Скачиваем и проверяем checksum
-OLLAMA_SHA256=$(curl -s "https://api.github.com/repos/ollama/ollama/releases/latest" | \
-    jq -r '.assets[] | select(.name | contains("ollama-linux-amd64.tgz")) | .download_count')
-
-if [ "$OLLAMA_SHA256" == "null" ]; then
-    echo "❌ Не удалось получить checksum для Ollama"
+# Проверка наличия Proxmox CLI
+if ! command -v pct &> /dev/null; then
+    echo "Ошибка: Proxmox CLI не найден. Установите pve-tools."
     exit 1
 fi
 
-# Проверяем существование checksum файла
-CHECKSUM_URL="${OLLAMA_URL%.*}.sha256"
-if curl -s "${CHECKSUM_URL}" >/dev/null; then
-    wget -q "${CHECKSUM_URL}" -O - | sha256sum --check --quiet || \
-        { echo "❌ Проверка checksum'a Ollama не пройдена"; exit 1; }
-fi
+# =============================================
+# Функция создания LXC-машины
+# =============================================
+create_lxc() {
+    echo "Создание LXC-машины $LXC_NAME (VMID: $LXC_VMID)..."
 
-wget -q "${OLLAMA_URL}" -O /tmp/ollama.tgz || \
-    { echo "❌ Ошибка при скачивании Ollama"; exit 1; }
+    # Создаем базовую VM из шаблона
+    pct create $LXC_VMID --memory $LXC_RAM --cores $LXC_CPU --disk $LXC_DISK --netvm $LXC_NETWORK --ostype $LXC_OS --hostname ollama-webui --unattended
 
-tar -xzf /tmp/ollama.tgz -C /usr/local/ || \
-    { echo "❌ Ошибка при разархивации Ollama"; exit 1; }
-rm -f /tmp/ollama.tgz
+    # Настраиваем сетевой интерфейс
+    pvesh set /nodes/pve/vms/$LXC_VMID/config --network0 name=eth0,bridge=$LXC_NETWORK,ip=$LXC_IP,ip6=none,gw=$LXC_GATEWAY,dns=$LXC_DNS
 
-# Создаем пользователя для Ollama
-useradd -r -m -d /var/lib/ollama -s /bin/false ollama || \
-    { echo "❌ Не удалось создать пользователя ollama"; exit 1; }
+    # Запускаем VM
+    pct start $LXC_VMID
 
-# Устанавливаем Ollama в PATH
-echo 'export PATH="/usr/local/bin:$PATH"' >> /root/.bashrc
+    # Ожидаем готовность VM (5 минут)
+    echo "Ожидание готовности VM (5 минут)..."
+    sleep 300
 
-# --------------------- Настройка systemd ---------------------
-OLLAMA_SERVICE=/etc/systemd/system/ollama.service
-cat > "$OLLAMA_SERVICE" <<EOF
-[Unit]
-Description=Ollama Service
-After=network.target docker.service
-Requires=docker.service
-
-[Service]
-ExecStart=/usr/local/bin/ollama serve
-Restart=always
-User=ollama
-Group=ollama
-RestartSec=5s
-Environment="OLLAMA_ORIGINS=*"
-Environment="OLLAMA_HOST=0.0.0.0"
-Environment="OLLAMA_PORT=11434"
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload || \
-    { echo "❌ Ошибка при релоаде systemd"; exit 1; }
-systemctl enable ollama || \
-    { echo "❌ Не удалось активировать ollama"; exit 1; }
-
-# --------------------- Проверка Ollama ---------------------
-echo "🔍 Проверяем Ollama..."
-if ! systemctl is-active ollama; then
-    systemctl start ollama
-    if ! systemctl is-active ollama; then
-        echo "❌ Ollama не запустился"
+    # Проверяем IP-адрес
+    IP=$(pct config $LXC_VMID | grep -oP 'ip=.*?/')
+    if [ -z "$IP" ]; then
+        echo "Ошибка: Не удалось определить IP-адрес LXC!"
+        pct stop $LXC_VMID
+        pct destroy $LXC_VMID
         exit 1
     fi
-fi
 
-# --------------------- Установка Docker-образа Open WebUI ---------------------
-echo "🚀 Устанавливаем Open WebUI..."
-docker run --name "$CONTAINER_NAME" \
-    -d \
-    --restart unless-stopped \
-    -p 8080:8080 \
-    -e OLLAMA_BASE_URL=http://localhost:11434 \
-    "$DOCKER_IMAGE" || \
-    { echo "❌ Ошибка при запуске Open WebUI"; exit 1; }
+    echo "LXC-машина успешно создана! IP: $IP"
+    return 0
+}
 
-# --------------------- Скачивание модели ---------------------
-echo "🤖 Скачиваем модель $DEFAULT_MODEL..."
-ollama pull "$DEFAULT_MODEL" || \
-    { echo "❌ Ошибка при скачивании модели"; exit 1; }
+# =============================================
+# Функция установки Ollama и Open WebUI
+# =============================================
+install_ollama_webui() {
+    echo "Установка Ollama и Open WebUI в LXC ($LXC_NAME)..."
 
-# --------------------- Проверка работоспособности ---------------------
-echo "🔧 Проверяем доступность Open WebUI..."
-if ! curl -s http://localhost:8080 | grep -q "Open WebUI"; then
-    echo "❌ Open WebUI не доступен по адресу http://localhost:8080"
-    exit 1
-fi
+    # Подключаемся к LXC (через pveguesthelper)
+    pct enter $LXC_VMID
 
-echo "✅ Все установлено успешно!"
-echo "📋 Доступ к Open WebUI: http://<ваш-ip>:8080"
-echo "📋 Обратите внимание: В первый раз может потребоваться некоторое время для инициализации"
+    # Обновляем систему
+    apt-get update && apt-get upgrade -y
+
+    # Устанавливаем зависимости
+    apt-get install -y curl wget apt-transport-https ca-certificates gnupg lsb-release
+
+    # Устанавливаем Docker (без конфликтов с Proxmox)
+    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb-release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+    apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+    # Добавляем пользователя в группу Docker
+    usermod -aG docker $USER
+
+    # Устанавливаем Ollama
+    curl -fsSL https://ollama.com/install.sh | sh
+
+    # Запускаем Ollama в фоновом режиме
+    ollama serve &
+
+    # Устанавливаем Open WebUI
+    docker run -d \
+      --name openwebui \
+      -e OLLAMA_BASE_URL=http://localhost:11434 \
+      -e OLLAMA_API_KEY="" \
+      -p 8080:8080 \
+      ghcr.io/open-webui/open-webui:main
+
+    # Загружаем модель (Llama2)
+    ollama pull llama2
+
+    # Проверяем доступность Open WebUI
+    echo "Open WebUI доступен по адресу: http://$IP:8080"
+    echo "Проверьте логи Docker для диагностики:"
+    echo "docker logs openwebui"
+}
+
+# =============================================
+# Основной скрипт
+# =============================================
+main() {
+    # Проверяем, существует ли уже VM
+    if pct list | grep -q "$LXC_NAME"; then
+        echo "VM $LXC_NAME уже существует!"
+        read -p "Хотите продолжить установку? (y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
+    else
+        create_lxc || exit 1
+    fi
+
+    # Устанавливаем Ollama и Open WebUI
+    install_ollama_webui || exit 1
+}
+
+main
